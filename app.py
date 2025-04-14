@@ -14,11 +14,16 @@ import math
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import requests
+import os
 import asyncio
+
+# Configure logging based on environment
+log_level_name = os.environ.get('LOG_LEVEL', 'INFO')
+log_level = getattr(logging, log_level_name)
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger("prediction_market")
@@ -49,10 +54,9 @@ VALID_PRICES = [round(0.5 + i * 0.5, 1) for i in range(19)]  # 0.5 to 9.5 in 0.5
 DEFAULT_MARKET_PRICE = 5.0  # Default price for both YES and NO
 TOTAL_PAYOUT = 10.0  # Total payout per contract
 
-# Configuration
-FRAPPE_API_URL = "https://sandbox.privacycard.in/api/method"
-FRAPPE_API_KEY = "f40fe7d10df6fe7:b04f22b862fa9c6"
 
+FRAPPE_API_URL = os.environ.get('FRAPPE_API_URL')
+FRAPPE_API_KEY = os.environ.get('FRAPPE_API_KEY')
 # Replace the RedisManager initialization in your app_new.py file with this:
 
 # Redis connection manager

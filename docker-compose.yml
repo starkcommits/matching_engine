@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   app:
     build: .
@@ -8,8 +6,8 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - FRAPPE_API_URL=${FRAPPE_API_URL:-https://sandbox.privacycard.in/api/method}
-      - FRAPPE_API_KEY=${FRAPPE_API_KEY:-f40fe7d10df6fe7:b04f22b862fa9c6}
+    env_file:
+      - .env.${ENVIRONMENT:-development}
     depends_on:
       - redis
     restart: unless-stopped
