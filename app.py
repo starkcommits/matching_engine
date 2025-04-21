@@ -14,16 +14,11 @@ import math
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import requests
-import os
 import asyncio
-
-# Configure logging based on environment
-log_level_name = os.environ.get('LOG_LEVEL', 'INFO')
-log_level = getattr(logging, log_level_name)
 
 # Configure logging
 logging.basicConfig(
-    level=log_level,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger("prediction_market")
@@ -54,22 +49,15 @@ VALID_PRICES = [round(0.5 + i * 0.5, 1) for i in range(19)]  # 0.5 to 9.5 in 0.5
 DEFAULT_MARKET_PRICE = 5.0  # Default price for both YES and NO
 TOTAL_PAYOUT = 10.0  # Total payout per contract
 
-
 FRAPPE_API_URL = os.environ.get('FRAPPE_API_URL')
 FRAPPE_API_KEY = os.environ.get('FRAPPE_API_KEY')
-# Replace the RedisManager initialization in your app_new.py file with this:
 
 # Redis connection manager
 class RedisManager:
-    def __init__(self, host=None, port=None, db=0, pool_size=10):
-        # Use environment variables or default to localhost if not specified
-        import os
-        self.host = host or os.environ.get('REDIS_HOST', 'localhost')
-        self.port = port or int(os.environ.get('REDIS_PORT', 6379))
-        
+    def __init__(self, host='localhost', port=6379, db=0, pool_size=10):
         self.connection_pool = redis.ConnectionPool(
-            host=self.host,
-            port=self.port,
+            host=host,
+            port=port,
             db=db,
             decode_responses=True,
             max_connections=pool_size
@@ -203,39 +191,6 @@ def generate_id(prefix):
     unique_id = str(uuid.uuid4()).replace('-', '')[:12]
     return f"{prefix}_{timestamp}_{unique_id}"
 
-# Frappe integration helpers
-def update_wallet(user_id, amount, transaction_type, market_id, description):
-    """Update user wallet in Frappe"""
-    try:
-        payload = {
-            "user_id": user_id,
-            "amount": amount,
-            "transaction_type": transaction_type,
-            "market_id": market_id,
-            "description": description
-        }
-        
-        headers = {
-            "Authorization": f"Token {FRAPPE_API_KEY}"
-        }
-        
-        response = requests.post(
-            f"{FRAPPE_API_URL}/rewardapp.wallet.update_wallet",
-            json=payload,
-            headers=headers
-        )
-        
-        if response.status_code != 200:
-            logger.error(f"Failed to update wallet: {response.text}")
-            return False
-        else:
-            logger.info(f"Wallet updated for user {user_id}: {amount}")
-            return True
-            
-    except Exception as e:
-        logger.error(f"Error updating wallet: {str(e)}")
-        return False
-
 
 # Frappe integration helpers
 def send_updated_market_price(market_id, yes_price, no_price):
@@ -269,133 +224,6 @@ def send_updated_market_price(market_id, yes_price, no_price):
         logger.error(f"Error in updating market: {str(e)}")
         return False
 
-
-@staticmethod
-def settle_market_positions(redis_client, market_id, winning_side):
-    """
-    Settle a resolved market by paying out users with winning positions
-    based on their BUY orders and accounting for SELL orders.
-    """
-    try:
-        logger.info(f"Starting settlement for market {market_id} with winning side {winning_side}")
-        
-        # Track user settlements (user_id -> payout amount)
-        settlements = {}
-        
-        # Get all orders for this market
-        order_ids = redis_client.smembers(f"market:{market_id}:{OrderType.BUY}:orders")
-        
-        # 1. Find all BUY orders for the winning side
-        for order_id in order_ids:
-            order = OrderBook.get_order(redis_client, order_id)
-            if not order:
-                continue
-                
-            # We're interested in BUY orders for the winning side
-            if order["order_type"] == OrderType.BUY and order["option_type"] == winning_side and order["status"] == OrderStatus.FILLED:
-                
-                # Calculate effective position by accounting for any sold positions
-                filled_quantity = order.get("filled_quantity", 0)
-                if filled_quantity is None:
-                    filled_quantity = 0
-
-                effective_position = filled_quantity
-                
-                if effective_position > 0:
-                    # Calculate payout: (10 - price) * effective_position
-                    payout = (TOTAL_PAYOUT - order["price"]) * effective_position
-                    
-                    # Add to user's settlement
-                    user_id = order["user_id"]
-                    if user_id not in settlements:
-                        settlements[user_id] = 0
-                    settlements[user_id] += payout
-                    
-                    logger.info(f"User {user_id} wins {payout} with effective position of {effective_position} @ {order['price']}")
-        
-        # 2. Process payouts
-        for user_id, amount in settlements.items():
-            update_wallet(
-                user_id,
-                amount,
-                "Credit",
-                market_id,
-                f"Payout for winning {winning_side} positions in market {market_id}"
-            )
-            logger.info(f"Paid {amount} to user {user_id} for winning positions")
-        
-        # Notify Frappe
-        send_settlements_to_frappe(market_id, settlements, winning_side)
-        
-        logger.info(f"Market {market_id} resolved with winning side: {winning_side}")
-        return True
-    except Exception as e:
-        logger.error(f"Error settling market positions: {str(e)}")
-        return False
-    
-def check_wallet_balance(user_id, required_amount):
-    """Check if user has sufficient balance"""
-    try:
-        headers = {
-            "Authorization": f"Token {FRAPPE_API_KEY}"
-        }
-        
-        response = requests.get(
-            f"{FRAPPE_API_URL}/rewardapp.wallet.get_balance?user_id={user_id}",
-            headers=headers,
-            timeout=5
-        )
-        
-        if response.status_code != 200:
-            logger.error(f"Failed to check wallet balance: {response.text}")
-            return False
-            
-        data = response.json()
-        print(data)
-        if not data.get("message"):
-            logger.error(f"Invalid response format: {data}")
-            return False
-            
-        balance = data["message"]["wallet"].get("balance", 0)
-        return balance >= required_amount
-            
-    except Exception as e:
-        logger.error(f"Error checking wallet balance: {str(e)}")
-        return False
-
-def send_settlements_to_frappe(market_id, settlements, winning_side):
-    """Send settlement data to Frappe"""
-    try:
-        payload = {
-            "market_id": market_id,
-            "winning_side": winning_side,
-            "settlements": [
-                {"user_id": user_id, "amount": amount}
-                for user_id, amount in settlements.items()
-            ]
-        }
-        
-        headers = {
-            "Authorization": f"Token {FRAPPE_API_KEY}"
-        }
-        
-        response = requests.post(
-            f"{FRAPPE_API_URL}/rewardapp.engine.market_settlements",
-            json=payload,
-            headers=headers,
-            timeout=5
-        )
-        
-        if response.status_code != 200:
-            logger.error(f"Failed to send settlements to Frappe: {response.text}")
-            return False
-        else:
-            logger.info(f"Sent settlements for market {market_id} to Frappe")
-            return True
-            
-    except Exception as e:
-        logger.error(f"Error sending settlements to Frappe: {str(e)}")
-        return False
 
 def send_order_update_to_frappe(order):
     """Send order status update to Frappe"""
@@ -451,6 +279,8 @@ def send_trades_to_frappe(trades):
                     "second_user_id": trade["second_user_id"],
                     "first_user_price": trade["first_user_price"],
                     "second_user_price": trade["second_user_price"],
+                    "first_user_option": trade["first_user_option"],
+                    "second_user_option": trade["second_user_option"],
                     "quantity": trade["quantity"],
                     "executed_at": trade["executed_at"]
                 }
@@ -480,115 +310,6 @@ def send_trades_to_frappe(trades):
         logger.error(f"Error sending trades to Frappe: {str(e)}")
         return False
 
-
-def send_unmatched_orders_to_frappe(market_id, redis_client):
-    """Refund unmatched and partially matched BUY orders when market closes"""
-    try:
-        unmatched_orders = []
-        
-        # Get all orders for this market
-        option_types = [OptionType.YES, OptionType.NO]
-        
-        # Process BUY orders only
-        for opt_type in option_types:
-            order_book_key = f"order_book:{market_id}:{opt_type}:{OrderType.BUY}"
-            order_ids = redis_client.zrange(order_book_key, 0, -1)
-                
-            for order_id in order_ids:
-                order = OrderBook.get_order(redis_client, order_id)
-                if order and order["status"] in [OrderStatus.OPEN, OrderStatus.PARTIAL]:
-                    # Calculate unfilled quantity
-                    unfilled_qty = order["quantity"] - order["filled_quantity"]
-                    
-                    if unfilled_qty > 0:
-                        # Refund for unfilled portion
-                        refund_amount = unfilled_qty * order["price"]
-                        update_wallet(
-                            order["user_id"],
-                            refund_amount,
-                            "Credit",
-                            market_id,
-                            f"Refund for unmatched {order['option_type']} BUY order on market closure"
-                        )
-                        
-                        # Update order status
-                        if order["status"] == OrderStatus.OPEN:
-                            order["status"] = OrderStatus.CANCELLED
-                        else:  # PARTIAL
-                            order["quantity"]= order["filled_quantity"]
-                            order["status"] = OrderStatus.FILLED  # Mark as filled since partial was filled and rest refunded
-                            
-                        order["updated_at"] = datetime.utcnow().isoformat()
-                        redis_client.set(f"order:{order_id}", json.dumps(order))
-                        
-                        # Remove from order book
-                        redis_client.zrem(order_book_key, order_id)
-                        
-                        # Add to list to send to Frappe
-                        unmatched_orders.append(order)
-        
-        if not unmatched_orders:
-            logger.info(f"No unmatched orders for market {market_id}")
-            return True
-            
-        # Send to Frappe
-        payload = {
-            "market_id": market_id,
-            "unmatched_orders": unmatched_orders
-        }
-        
-        headers = {
-            "Authorization": f"Token {FRAPPE_API_KEY}"
-        }
-        
-        response = requests.post(
-            f"{FRAPPE_API_URL}/rewardapp.engine.unmatched_orders",
-            json=payload,
-            headers=headers,
-            timeout=5
-        )
-        
-        if response.status_code != 200:
-            logger.error(f"Failed to send unmatched orders to Frappe: {response.text}")
-            return False
-        else:
-            logger.info(f"Sent {len(unmatched_orders)} unmatched orders to Frappe for market {market_id}")
-            return True
-            
-    except Exception as e:
-        logger.error(f"Error sending unmatched orders to Frappe: {str(e)}")
-        return False
-
-
-def process_full_market_closure(redis_client, market_id, winning_side):
-    """Process the complete workflow for market closure, resolution and settlement"""
-    try:
-        logger.info(f"Starting full market closure process for {market_id} with winning side {winning_side}")
-
-        # Step 1: Settle positions and process payments
-        settlement_success = settle_market_positions(redis_client, market_id, winning_side)
-        if not settlement_success:
-            logger.error(f"Failed to settle positions for market {market_id}")
-            return {
-                "success": False,
-                "stage": "settlement",
-                "message": "Failed to settle positions"
-            }
-        
-        logger.info(f"Completed full market closure process for {market_id}")
-        return {
-            "success": True,
-            "stage": "complete",
-            "message": f"Market {market_id} closed, resolved, and settled successfully"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in market closure process: {str(e)}")
-        return {
-            "success": False,
-            "stage": "exception",
-            "message": f"Error: {str(e)}"
-        }
 
 # Market operations
 class MarketManager:
@@ -643,10 +364,7 @@ class MarketManager:
     @staticmethod
     def close_market(redis_client, market_id):
         """
-        Close a market, handling unmatched orders and position transfers.
-        1. Process all SELL orders - transfer remaining quantities to linked BUY orders
-        2. Refund all unmatched/partially matched BUY orders
-        3. Update market status
+        1. Update market status
         """
         try:
             logger.info(f"Starting market closure process for {market_id}")
@@ -665,65 +383,6 @@ class MarketManager:
                 logger.warning(f"Market {market_id} is already in {market_data['status']} state")
                 return False
             
-            # Start a transaction for all the updates
-            pipe = redis_client.pipeline()
-                
-            sell_ids = redis_client.smembers(f"market:{market_id}:{OrderType.SELL}:orders")
-
-            for sell_order_id in sell_ids:
-                sell_order = OrderBook.get_order(redis_client, sell_order_id)
-                if not sell_order:
-                    continue
-                
-                # Get the linked buy order
-                linked_order_id = sell_order.get("linked_order_id")
-                if not linked_order_id:
-                    logger.warning(f"SELL order {sell_order_id} has no linked order")
-                    continue
-                    
-                linked_order = OrderBook.get_order(redis_client, linked_order_id)
-                if not linked_order:
-                    logger.warning(f"Linked order {linked_order_id} not found")
-                    continue
-                
-                # Calculate unmatched quantity in SELL order
-                sell_filled = sell_order.get("filled_quantity", 0)
-                if sell_filled is None:
-                    sell_filled = 0
-                    
-                unmatched_qty = sell_order["quantity"] - sell_filled
-                
-                if unmatched_qty <0:
-                    continue
-                
-                linked_order_updated = {
-                    **linked_order,
-                    "quantity":unmatched_qty,
-                    "filled_quantity":unmatched_qty,
-                    "updated_at": datetime.utcnow().isoformat()
-                }
-                pipe.set(f"order:{linked_order_id}", json.dumps(linked_order_updated))
-                
-                send_order_update_to_frappe(linked_order_updated)
-
-                # Mark the SELL order as FILLED since we're handling the remaining quantity
-                sell_order_updated = {
-                    **sell_order,
-                    "status": OrderStatus.SETTLED,
-                    "updated_at": datetime.utcnow().isoformat()
-                }
-                pipe.set(f"order:{sell_order_id}", json.dumps(sell_order_updated))
-                
-                sell_key = f"order_book:{market_id}:{sell_order_updated['option_type']}:{OrderType.SELL}"
-
-                # Remove from order book
-                pipe.zrem(sell_key, sell_order_id)
-                
-                # send order update to frappe
-                send_order_update_to_frappe(sell_order_updated)
-
-
-
             # Update status
             market_data["status"] = MarketStatus.CLOSED
             market_data["closed_at"] = datetime.utcnow().isoformat()
@@ -734,12 +393,6 @@ class MarketManager:
             # Move from open to closed set
             redis_client.srem("markets:open", market_id)
             redis_client.sadd("markets:closed", market_id)
-            
-            # Send unmatched orders back to Frappe
-            send_unmatched_orders_to_frappe(market_id, redis_client)
-
-            # Execute all updates atomically
-            pipe.execute()
 
             logger.info(f"Market {market_id} closed")
             return True
@@ -747,38 +400,6 @@ class MarketManager:
         except Exception as e:
             logger.error(f"Error closing market: {str(e)}")
             return False
-
-    @staticmethod
-    def resolve_market(redis_client, market_id, winning_side):
-        """Resolve a market with winning side"""
-        market_key = f"market:{market_id}:data"
-        market_data_json = redis_client.get(market_key)
-        
-        if not market_data_json:
-            logger.warning(f"Market {market_id} not found")
-            return False
-            
-        market_data = json.loads(market_data_json)
-        
-        # Make sure market is closed
-        if market_data["status"] != MarketStatus.CLOSED:
-            logger.warning(f"Cannot resolve market {market_id} that is not closed")
-            return False
-            
-        # Update status
-        market_data["status"] = MarketStatus.RESOLVED
-        market_data["winning_side"] = winning_side
-        market_data["resolved_at"] = datetime.utcnow().isoformat()
-        
-        # Save updates
-        redis_client.set(market_key, json.dumps(market_data))
-        
-        # Move from closed to resolved set
-        redis_client.srem("markets:closed", market_id)
-        redis_client.sadd("markets:resolved", market_id)
-        
-        logger.info(f"Market {market_id} resolved with winning side: {winning_side}")
-        return True
     
     @staticmethod
     def update_market_prices_with_vwap(redis_client, market_id, window_size=10):
@@ -1091,19 +712,7 @@ class OrderBook:
             
             # Execute transaction
             pipe.execute()
-            
-            # Handle wallet transaction for BUY orders
-            if order_type == OrderType.BUY:
-                amount = -(order_data["quantity"] * order_data["price"])
-                update_wallet(
-                    order_data["user_id"],
-                    amount,
-                    "Debit",
-                    market_id,
-                    f"Buy {order_data['quantity']} {option_type} @ {order_data['price']} in market {market_id}"
-                )
-            
-            logger.info(f"Added {order_type} order {order_id} for {option_type} in market {market_id}")
+
             return full_order
         except RedisError as e:
             logger.error(f"Redis error adding order: {str(e)}")
@@ -1191,7 +800,7 @@ class OrderBook:
             MarketManager.update_market_prices_with_vwap(redis_client, market_id)
             
             # Send trades to Frappe
-            # send_trades_to_frappe([t for t in matched_trades if isinstance(t, dict)])
+            send_trades_to_frappe([t for t in matched_trades if isinstance(t, dict)])
         
         return matched_trades
 
@@ -1374,6 +983,8 @@ class OrderBook:
                         "second_user_order_id": no_order_id,
                         "first_user_id": yes_order["user_id"],
                         "second_user_id": no_order["user_id"],
+                        "first_user_option": yes_order["option_type"],
+                        "second_user_option": no_order["option_type"],
                         "first_user_price": yes_price,
                         "second_user_price": no_price,
                         "quantity": match_quantity,
@@ -1471,8 +1082,7 @@ class OrderBook:
     def _match_sell_orders(redis_client, market_id):
         """
         Match SELL orders with BUY orders of the same option type.
-        SELL orders just create a trade record and record a refund if applicable.
-        The linked BUY order's remaining quantity will be updated during market closure.
+        Simple trade matching without requiring linked BUY orders.
         """
         matched_trades = []
         
@@ -1498,36 +1108,6 @@ class OrderBook:
                     if filled_quantity is None:
                         filled_quantity = 0
                         
-                    # Get linked buy order if it exists (SELL orders should have an original BUY order linked)
-                    linked_order_id = order.get("linked_order_id")
-                    
-                    if not linked_order_id:
-                        logger.warning(f"SELL order {sell_order_id} has no linked order")
-                        continue  # Skip SELL orders without a linked BUY order
-                    
-                    # Get the linked original buy order
-                    linked_order = OrderBook.get_order(redis_client, linked_order_id)
-                        
-                    if not linked_order:
-                        logger.warning(f"Linked order {linked_order_id} for SELL order {sell_order_id} not found")
-                        continue  # Skip if linked order doesn't exist
-                    
-                    # Verify the linked order belongs to the same user
-                    if linked_order["user_id"] != order["user_id"]:
-                        logger.warning(f"Linked order {linked_order_id} belongs to user {linked_order['user_id']}, but SELL order is from {order['user_id']}")
-                        continue
-                    
-                    # Verify the linked order is for the same option type
-                    if linked_order["option_type"] != order["option_type"]:
-                        logger.warning(f"Linked order option type {linked_order['option_type']} doesn't match SELL order option type {order['option_type']}")
-                        continue
-                    
-                    # Track the original buy price for settlement calculation
-                    original_buy_price = linked_order.get("price")
-                    if original_buy_price is None:
-                        logger.warning(f"Linked order {linked_order_id} has no price")
-                        continue
-                        
                     remaining = order["quantity"] - filled_quantity
                     if remaining > 0:
                         sell_orders.append({
@@ -1535,10 +1115,7 @@ class OrderBook:
                             "order": order,
                             "price": score,  # Already ordered correctly for SELLs
                             "remaining": remaining,
-                            "filled_quantity": filled_quantity,  # Track current filled quantity
-                            "linked_order_id": linked_order_id,
-                            "linked_order": linked_order,
-                            "original_buy_price": original_buy_price
+                            "filled_quantity": filled_quantity  # Track current filled quantity
                         })
             
             # Collect valid BUY orders
@@ -1572,9 +1149,6 @@ class OrderBook:
                 sell_price = sell_data["price"]
                 sell_remaining = sell_data["remaining"]
                 sell_filled = sell_data["filled_quantity"]
-                original_buy_price = sell_data["original_buy_price"]
-                linked_order_id = sell_data["linked_order_id"]
-                linked_order = sell_data["linked_order"]
                 
                 if sell_remaining <= 0:
                     sell_idx += 1
@@ -1619,11 +1193,10 @@ class OrderBook:
                         # Get fresh copies of orders from Redis
                         sell_order_fresh = OrderBook.get_order(redis_client, sell_order_id)
                         buy_order_fresh = OrderBook.get_order(redis_client, buy_order_id)
-                        linked_order_fresh = OrderBook.get_order(redis_client, linked_order_id)
                         
                         # Skip if orders have been modified or removed
-                        if not sell_order_fresh or not buy_order_fresh or not linked_order_fresh:
-                            logger.warning(f"Order disappeared during matching: SELL={sell_order_id}, BUY={buy_order_id}, LINKED={linked_order_id}")
+                        if not sell_order_fresh or not buy_order_fresh:
+                            logger.warning(f"Order disappeared during matching: SELL={sell_order_id}, BUY={buy_order_id}")
                             buy_idx += 1
                             continue
                         
@@ -1699,15 +1272,14 @@ class OrderBook:
                         trade = {
                             "trade_id": generate_id("trade"),
                             "market_id": market_id,
-                            "sell_order_id": sell_order_id,
-                            "buy_order_id": buy_order_id,
-                            "sell_user_id": sell_order["user_id"],
-                            "buy_user_id": buy_order["user_id"],
-                            "linked_order_id": linked_order_id,
-                            "option_type": option_type,
-                            "sell_price": sell_price,
-                            "buy_price": buy_price,
-                            "original_buy_price": original_buy_price,
+                            "first_user_order_id": sell_order_id,
+                            "second_user_order_id": buy_order_id,
+                            "first_user_id": sell_order["user_id"],
+                            "second_user_id": buy_order["user_id"],
+                            "first_user_option": option_type,
+                            "second_user_option": option_type,
+                            "first_user_price": sell_price,
+                            "second_user_price": buy_price,
                             "quantity": match_quantity,
                             "executed_at": datetime.utcnow().isoformat()
                         }
@@ -1719,7 +1291,6 @@ class OrderBook:
                         # Add to order-trade indices
                         pipe.sadd(f"order:{sell_order_id}:trades", trade["trade_id"])
                         pipe.sadd(f"order:{buy_order_id}:trades", trade["trade_id"])
-                        pipe.sadd(f"order:{linked_order_id}:trades", trade["trade_id"])
                         
                         # Update SELL order
                         sell_status = OrderStatus.FILLED if new_sell_filled >= sell_order_fresh["quantity"] else OrderStatus.PARTIAL
@@ -1756,21 +1327,6 @@ class OrderBook:
                         send_order_update_to_frappe(sell_order_updated)
                         send_order_update_to_frappe(buy_order_updated)
                         
-                        # Calculate the price difference for refund
-                        # For a SELL order, the user gets refunded: (sell_price - original_buy_price) * match_quantity
-                        refund_amount = (sell_price - original_buy_price) * match_quantity
-                        
-                        # Handle wallet transaction for seller - they receive the price difference as refund
-                        if refund_amount > 0:
-                            update_wallet(
-                                sell_order["user_id"],
-                                refund_amount,
-                                "Credit",
-                                market_id,
-                                f"Refund for price difference on SELL {match_quantity} {option_type} (bought @ {original_buy_price}, sold @ {sell_price})"
-                            )
-                            logger.info(f"Refunded {refund_amount} to user {sell_order['user_id']} for price difference")
-                        
                         # Add trade to results
                         matched_trades.append(trade)
                         
@@ -1804,10 +1360,8 @@ class OrderBook:
                 # If no match was found or the SELL order is fully matched, move to the next SELL order
                 if not match_found or sell_remaining <= 0:
                     sell_idx += 1
-        
-        return matched_trades
 
-    
+        return matched_trades
 # API endpoints
 @app.post("/markets/", status_code=status.HTTP_201_CREATED)
 async def create_market(market: MarketRequest, redis_client = Depends(get_redis)):
@@ -1872,51 +1426,12 @@ async def close_market(
             detail=f"Failed to process market closure: {str(e)}"
         )
 
-@app.post("/markets/{market_id}/resolve", status_code=status.HTTP_200_OK)
-async def resolve_market(market_id: str, resolution: MarketResolutionRequest, redis_client = Depends(get_redis)):
-    """Resolve a market with the winning side"""
-    try:
-        success = MarketManager.resolve_market(redis_client, market_id, resolution.winning_side)
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Market {market_id} not found or not in closed state"
-            )
-        result = process_full_market_closure(redis_client, market_id, resolution.winning_side)
-        if result["success"]:
-            return {"message": f"Market {market_id} resolved successfully with winning side: {resolution.winning_side}"}
-        return {
-            "message":"Error in market resolution."
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error resolving market: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to resolve market: {str(e)}"
-        )
-
 @app.post("/orders/", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
 async def place_order(order: OrderRequest, background_tasks: BackgroundTasks, redis_client = Depends(get_redis)):
     """Place a new order in the market"""
     try:
-        # logger.info(f"Placed order {order}")
-        # For BUY orders, check wallet balance
-        # if order.order_type == OrderType.BUY:
-        #     required_amount = order.quantity * order.price
-        #     if not check_wallet_balance(order.user_id, required_amount):
-        #         raise HTTPException(
-        #             status_code=status.HTTP_400_BAD_REQUEST,
-        #             detail="Insufficient wallet balance"
-        #         )
-        
-        # Add the order to the book
         new_order = OrderBook.add_order(redis_client, order.dict())
-        
-        # Update market prices immediately
-        # MarketManager.update_market_prices(redis_client, order.market_id)
-        
+
         # Match orders in the background
         background_tasks.add_task(OrderBook.match_orders, redis_client, order.market_id)
         
@@ -1929,17 +1444,6 @@ async def place_order(order: OrderRequest, background_tasks: BackgroundTasks, re
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process order: {str(e)}"
         )
-
-@app.get("/orders/{order_id}", response_model=OrderResponse)
-async def get_order(order_id: str, redis_client = Depends(get_redis)):
-    """Get details of a specific order"""
-    order = OrderBook.get_order(redis_client, order_id)
-    if not order:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found"
-        )
-    return order
 
 @app.delete("/orders/{order_id}", status_code=status.HTTP_200_OK)
 async def cancel_order(order_id: str, redis_client = Depends(get_redis)):
@@ -1968,52 +1472,7 @@ async def cancel_order(order_id: str, redis_client = Depends(get_redis)):
     try:
         # Start a transaction
         pipe = redis_client.pipeline()
-        
-        # Different handling for SELL vs BUY orders
-        if order["order_type"] == OrderType.SELL:
-            linked_order_id = order.get("linked_order_id")
-            if linked_order_id:
-                # Get the linked buy order
-                buy_order = OrderBook.get_order(redis_client, linked_order_id)
-                if buy_order:
-                    # Calculate how much was filled in the SELL order
-                    sell_filled_qty = order.get("filled_quantity", 0) or 0
-                    
-                    # Calculate the remaining quantity that's available for selling again
-                    remaining_qty = order["quantity"] - sell_filled_qty
-                    
-                    # Update the BUY order's filled quantity to account for the canceled SELL
-                    # Subtract the unfilled SELL quantity from the BUY order's filled quantity
-                    # buy_filled_qty = buy_order.get("filled_quantity", 0) or 0
-                    # new_buy_filled_qty = max(0, buy_filled_qty - remaining_qty)
-                    
-                    updated_buy_order = {
-                        **buy_order,
-                        "quantity": remaining_qty,
-                        "filled_quantity": remaining_qty,
-                        "status": OrderStatus.FILLED,
-                        "updated_at": datetime.utcnow().isoformat()
-                    }
-                    
-                    # Save updated BUY order
-                    pipe.set(f"order:{linked_order_id}", json.dumps(updated_buy_order))
-                    
-                    # Update the status for FRAPPE
-                    send_order_update_to_frappe(updated_buy_order)
-        
-        # For BUY orders, handle refund
-        elif order["order_type"] == OrderType.BUY:
-            unfilled_qty = order["quantity"] - order["filled_quantity"]
-            if unfilled_qty > 0:
-                refund_amount = unfilled_qty * order["price"]
-                update_wallet(
-                    order["user_id"],
-                    refund_amount,  # Positive amount = credit
-                    "Credit",
-                    order['market_id'],
-                    f"Refund for cancelled {order['option_type']} order in market {order['market_id']}"
-                )
-        
+    
         # Remove from order book
         OrderBook.remove_order_from_book(redis_client, order)
         
@@ -2027,8 +1486,6 @@ async def cancel_order(order_id: str, redis_client = Depends(get_redis)):
         
         # Execute the transaction
         pipe.execute()
-        
-        # send_order_update_to_frappe(updated_order)
         
         # Return appropriate response based on order type
         if order["order_type"] == OrderType.SELL:
@@ -2047,137 +1504,6 @@ async def cancel_order(order_id: str, redis_client = Depends(get_redis)):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to cancel order"
-        )
-
-
-@app.post("/markets/{market_id}/match", status_code=status.HTTP_200_OK)
-async def match_market_orders(market_id: str, redis_client = Depends(get_redis)):
-    """Manually trigger order matching for a specific market"""
-    try:
-        matched_trades = OrderBook.match_orders(redis_client, market_id)
-        return {"market_id": market_id, "matched_trades": len(matched_trades)}
-    except Exception as e:
-        logger.error(f"Error matching orders: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to match orders"
-        )
-
-@app.get("/markets/{market_id}/order-book", status_code=status.HTTP_200_OK)
-async def get_market_order_book(
-    market_id: str, 
-    option_type: Optional[OptionType] = None,
-    redis_client = Depends(get_redis)
-):
-    """Get the current order book for a market"""
-    try:
-        result = {"market_id": market_id, "buy_orders": {}, "sell_orders": {}}
-        option_types = [option_type] if option_type else [OptionType.YES, OptionType.NO]
-        
-        for opt_type in option_types:
-            # Get buy orders
-            buy_orders_key = f"order_book:{market_id}:{opt_type}:{OrderType.BUY}"
-            buy_order_ids = redis_client.zrange(buy_orders_key, 0, -1)
-            
-            # Get sell orders
-            sell_orders_key = f"order_book:{market_id}:{opt_type}:{OrderType.SELL}"
-            sell_order_ids = redis_client.zrange(sell_orders_key, 0, -1)
-            
-            # Fill buy orders
-            if opt_type not in result["buy_orders"]:
-                result["buy_orders"][opt_type] = []
-                
-            for order_id in buy_order_ids:
-                order = OrderBook.get_order(redis_client, order_id)
-                if order:
-                    result["buy_orders"][opt_type].append(order)
-            
-            # Fill sell orders
-            if opt_type not in result["sell_orders"]:
-                result["sell_orders"][opt_type] = []
-                
-            for order_id in sell_order_ids:
-                order = OrderBook.get_order(redis_client, order_id)
-                if order:
-                    result["sell_orders"][opt_type].append(order)
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error retrieving order book: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve order book"
-        )
-
-@app.get("/markets/{market_id}/price", response_model=MarketPriceResponse)
-async def get_market_price(market_id: str, redis_client = Depends(get_redis)):
-    """Get the current market price and probability for a market"""
-    try:
-        # Force recalculation of market prices
-        market_data = MarketManager.update_market_prices(redis_client, market_id)
-        
-        if not market_data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Market not found"
-            )
-        
-        # Calculate probabilities
-        yes_price = market_data["yes_price"]
-        no_price = market_data["no_price"]
-        
-        yes_probability = yes_price / 10 * 100
-        no_probability = no_price / 10 * 100
-        
-        result = {
-            "market_id": market_id,
-            "last_updated": market_data["last_updated"],
-            "YES": {
-                "price": yes_price,
-                "probability": yes_probability
-            },
-            "NO": {
-                "price": no_price,
-                "probability": no_probability
-            }
-        }
-        
-        return result
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error retrieving market price: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve market price"
-        )
-
-@app.get("/markets/{market_id}/trades", status_code=status.HTTP_200_OK)
-async def get_market_trades(market_id: str, redis_client = Depends(get_redis)):
-    """Get all trades executed for a market"""
-    try:
-        trades = []
-        # Get trade IDs for the market
-        trade_ids = redis_client.smembers(f"market:{market_id}:trades")
-        
-        # Get trade details
-        for trade_id in trade_ids:
-            trade_json = redis_client.get(f"trade:{trade_id}")
-            if trade_json:
-                trade = json.loads(trade_json)
-                trades.append(trade)
-        
-        # Sort by execution time (newest first)
-        trades.sort(key=lambda t: t["executed_at"], reverse=True)
-        
-        return {"market_id": market_id, "trades": trades}
-    except Exception as e:
-        logger.error(f"Error retrieving market trades: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to retrieve market trades"
         )
 
 @app.get("/health", status_code=status.HTTP_200_OK)
