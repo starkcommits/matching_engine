@@ -7,6 +7,7 @@ from redis.exceptions import RedisError
 import json
 import uuid
 import logging
+import os
 from enum import Enum
 from datetime import datetime
 import time
@@ -226,41 +227,49 @@ def send_updated_market_price(market_id, yes_price, no_price):
 
 
 def send_order_update_to_frappe(order):
-    """Send order status update to Frappe"""
-    try:
-        payload = {
-            "order_id": order["order_id"],
-            "user_id": order["user_id"],
-            "market_id": order["market_id"],
-            "option_type": order["option_type"],
-            "price": order["price"],
-            "quantity": order["quantity"],
-            "filled_quantity": order["filled_quantity"],
-            "order_type": order["order_type"],
-            "status": order["status"]
-        }
-        
-        headers = {
-            "Authorization": f"Token {FRAPPE_API_KEY}"
-        }
-        
-        response = requests.post(
-            f"{FRAPPE_API_URL}/rewardapp.engine.update_order",
-            json=payload,
-            headers=headers,
-            timeout=5
-        )
-        
-        if response.status_code != 200:
-            logger.error(f"Failed to update order in Frappe: {response.text}")
-            return False
-        else:
-            logger.info(f"Order {order['order_id']} status update sent to Frappe")
-            return True
+    """Send order status update to Frappe asynchronously"""
+    def _send_update():
+        try:
+            payload = {
+                "order_id": order["order_id"],
+                "user_id": order["user_id"],
+                "market_id": order["market_id"],
+                "option_type": order["option_type"],
+                "price": order["price"],
+                "quantity": order["quantity"],
+                "filled_quantity": order["filled_quantity"],
+                "order_type": order["order_type"],
+                "status": order["status"]
+            }
             
-    except Exception as e:
-        logger.error(f"Error sending order update to Frappe: {str(e)}")
-        return False
+            headers = {
+                "Authorization": f"Token {FRAPPE_API_KEY}"
+            }
+            
+            response = requests.post(
+                f"{FRAPPE_API_URL}/rewardapp.engine.update_order",
+                json=payload,
+                headers=headers,
+                timeout=10
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to update order in Frappe: {response.text}")
+                return False
+            else:
+                logger.info(f"Order {order['order_id']} status update sent to Frappe")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error sending order update to Frappe: {str(e)}")
+            return False
+    
+    # Start the request in a separate thread
+    import threading
+    thread = threading.Thread(target=_send_update)
+    thread.daemon = True
+    thread.start()
+    return True
 
 def send_trades_to_frappe(trades):
     """Send executed trades to Frappe"""
