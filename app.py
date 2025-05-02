@@ -46,7 +46,7 @@ class MarketStatus(str, Enum):
     RESOLVED = "RESOLVED"
 
 # Market state and configuration
-VALID_PRICES = [round(0.5 + i * 0.5, 1) for i in range(19)]  # 0.5 to 9.5 in 0.5 increments
+VALID_PRICES = [round(0.5 + i * 0.1, 1) for i in range(91)]  # 0.5 to 9.5 in 0.5 increments
 DEFAULT_MARKET_PRICE = 5.0  # Default price for both YES and NO
 TOTAL_PAYOUT = 10.0  # Total payout per contract
 
@@ -55,7 +55,11 @@ FRAPPE_API_KEY = os.environ.get('FRAPPE_API_KEY')
 
 # Redis connection manager
 class RedisManager:
-    def __init__(self, host='localhost', port=6379, db=0, pool_size=10):
+    def __init__(self, 
+                 host=os.environ.get('REDIS_HOST', '127.0.0.1'),
+                 port=int(os.environ.get('REDIS_PORT', 6379)),
+                 db=0, 
+                 pool_size=10):
         self.connection_pool = redis.ConnectionPool(
             host=host,
             port=port,
@@ -104,9 +108,10 @@ class MarketRequest(BaseModel):
     closing_time: str = Field(..., description="ISO formatted closing time")
     status: MarketStatus = Field(default=MarketStatus.OPEN)
 
-class MarketResolutionRequest(BaseModel):
-    winning_side: OptionType = Field(..., description="Winning option (YES or NO)")
-
+class UpdateOrderRequest(BaseModel):
+    order_id: str = Field(..., description="ID of the order to update")
+    new_quantity: int = Field(..., gt=0, description="New order quantity (must be less than original quantity)")
+ 
 class OrderResponse(BaseModel):
     order_id: str
     user_id: str
@@ -410,246 +415,6 @@ class MarketManager:
             logger.error(f"Error closing market: {str(e)}")
             return False
     
-    @staticmethod
-    def update_market_prices_with_vwap(redis_client, market_id, window_size=10):
-        """
-        Update market prices using Volume-Weighted Average Price (VWAP) from recent trades.
-        Falls back to order book depth for markets with insufficient trading history.
-        
-        Args:
-            redis_client: Redis connection
-            market_id: ID of the market
-            window_size: Number of recent trades to consider
-        """
-        try:
-            # Get market data
-            market_data = MarketManager.get_market_data(redis_client, market_id)
-            if not market_data:
-                logger.warning(f"Market {market_id} not found")
-                return None
-                    
-            # Skip if market is not open
-            if market_data["status"] != MarketStatus.OPEN:
-                logger.info(f"Market {market_id} is not open, skipping price update")
-                return market_data
-            
-            # Get all trade IDs for this market
-            trade_ids = redis_client.smembers(f"market:{market_id}:trades")
-            
-            # If no trades exist, fall back to order book depth pricing
-            if not trade_ids:
-                logger.info(f"No trades found for market {market_id}, using order book depth")
-                return MarketManager._calculate_demand_based_prices(redis_client, market_id)
-            
-            # Get all trades and sort by execution time (newest first)
-            all_trades = []
-            for trade_id in trade_ids:
-                trade_json = redis_client.get(f"trade:{trade_id}")
-                if not trade_json:
-                    continue
-                    
-                trade = json.loads(trade_json)
-                trade['execution_time'] = datetime.fromisoformat(trade["executed_at"])
-                all_trades.append(trade)
-            
-            # Sort by timestamp (newest first)
-            all_trades.sort(key=lambda t: t['execution_time'], reverse=True)
-            
-            # Take only the most recent trades
-            recent_trades = all_trades[:window_size]
-            
-            if not recent_trades:
-                logger.info(f"No valid recent trades for market {market_id}, using order book depth")
-                return MarketManager._calculate_demand_based_prices(redis_client, market_id)
-            
-            # Calculate VWAP separately for YES and NO
-            yes_trades = []
-            no_trades = []
-            
-            for trade in recent_trades:
-                # Sort trades by type
-                if "yes_price" in trade and "no_price" in trade:
-                    # YES/NO matched trade
-                    yes_trades.append({
-                        'price': trade['yes_price'],
-                        'quantity': trade['quantity']
-                    })
-                    no_trades.append({
-                        'price': trade['no_price'],
-                        'quantity': trade['quantity']
-                    })
-                elif "option_type" in trade and "sell_price" in trade:
-                    # SELL/BUY of same option
-                    option_type = trade["option_type"]
-                    price = trade["sell_price"]
-                    quantity = trade["quantity"]
-                    
-                    if option_type == OptionType.YES:
-                        yes_trades.append({'price': price, 'quantity': quantity})
-                        # Add implied NO price for balance
-                        no_trades.append({'price': TOTAL_PAYOUT - price, 'quantity': quantity})
-                    else:  # NO
-                        no_trades.append({'price': price, 'quantity': quantity})
-                        # Add implied YES price for balance
-                        yes_trades.append({'price': TOTAL_PAYOUT - price, 'quantity': quantity})
-            
-            # Calculate VWAP
-            yes_price = MarketManager._calculate_vwap(yes_trades)
-            no_price = MarketManager._calculate_vwap(no_trades)
-            
-            # If either price is None, calculate from the other
-            if yes_price is None and no_price is not None:
-                yes_price = TOTAL_PAYOUT - no_price
-            elif no_price is None and yes_price is not None:
-                no_price = TOTAL_PAYOUT - yes_price
-            
-            # If both are None, fall back to demand-based pricing
-            if yes_price is None or no_price is None:
-                logger.info(f"Insufficient trade data for VWAP, using order book depth")
-                return MarketManager._calculate_demand_based_prices(redis_client, market_id)
-            
-            # Ensure prices are within valid range and properly rounded
-            yes_price = round(min(9.5, max(0.5, yes_price)) * 2) / 2
-            no_price = round(min(9.5, max(0.5, no_price)) * 2) / 2
-            
-            # Ensure they sum to TOTAL_PAYOUT after rounding
-            if abs(yes_price + no_price - TOTAL_PAYOUT) > 0.01:
-                # Adjust no_price to ensure the sum is correct
-                no_price = TOTAL_PAYOUT - yes_price
-                
-            logger.info(f"VWAP-based prices: YES={yes_price}, NO={no_price}")
-            
-            # Update market data
-            market_data["yes_price"] = yes_price
-            market_data["no_price"] = no_price
-            market_data["last_updated"] = datetime.utcnow().isoformat()
-            
-            send_updated_market_price(market_id, yes_price, no_price)
-            # Save to Redis
-            redis_client.set(f"market:{market_id}:data", json.dumps(market_data))
-            
-            return market_data
-        except Exception as e:
-            logger.error(f"Error calculating VWAP prices: {str(e)}")
-            return None
-
-    @staticmethod
-    def _calculate_vwap(trades):
-        """
-        Calculate Volume-Weighted Average Price (VWAP)
-        
-        Args:
-            trades: List of dicts with 'price' and 'quantity' keys
-            
-        Returns:
-            VWAP price or None if no trades
-        """
-        if not trades:
-            return None
-            
-        price_volume_sum = sum(trade['price'] * trade['quantity'] for trade in trades)
-        volume_sum = sum(trade['quantity'] for trade in trades)
-        
-        # Avoid division by zero
-        if volume_sum == 0:
-            return None
-            
-        return price_volume_sum / volume_sum
-
-    @staticmethod
-    def _calculate_demand_based_prices(redis_client, market_id):
-        """
-        Calculate market prices based on order book depth (original algorithm)
-        Used as fallback when there's insufficient trade data
-        """
-        try:
-            # Get market data
-            market_data = MarketManager.get_market_data(redis_client, market_id)
-            if not market_data:
-                logger.warning(f"Market {market_id} not found")
-                return None
-                
-            # Skip if market is not open
-            if market_data["status"] != MarketStatus.OPEN:
-                logger.info(f"Market {market_id} is not open, skipping price update")
-                return market_data
-            
-            # Get order book keys
-            yes_buy_key = f"order_book:{market_id}:{OptionType.YES}:{OrderType.BUY}"
-            no_buy_key = f"order_book:{market_id}:{OptionType.NO}:{OrderType.BUY}"
-            
-            # Get all buy orders
-            yes_buy_ids = redis_client.zrange(yes_buy_key, 0, -1)
-            no_buy_ids = redis_client.zrange(no_buy_key, 0, -1)
-            
-            logger.info(f"Found {len(yes_buy_ids)} YES buy orders and {len(no_buy_ids)} NO buy orders")
-            
-            # If no orders, keep existing prices or use defaults
-            if not yes_buy_ids and not no_buy_ids:
-                return market_data
-                
-            # Calculate demand quantities
-            yes_qty = 0
-            no_qty = 0
-            
-            for order_id in yes_buy_ids:
-                order = OrderBook.get_order(redis_client, order_id)
-                if order and order["status"] not in [OrderStatus.FILLED, OrderStatus.CANCELLED]:
-                    # Handle case where filled_quantity might be None
-                    filled_qty = order.get("filled_quantity", 0)
-                    if filled_qty is None:
-                        filled_qty = 0
-                    yes_qty += order["quantity"] - filled_qty
-                    
-            for order_id in no_buy_ids:
-                order = OrderBook.get_order(redis_client, order_id)
-                if order and order["status"] not in [OrderStatus.FILLED, OrderStatus.CANCELLED]:
-                    # Handle case where filled_quantity might be None
-                    filled_qty = order.get("filled_quantity", 0)
-                    if filled_qty is None:
-                        filled_qty = 0
-                    no_qty += order["quantity"] - filled_qty
-            
-            logger.info(f"Calculated demand quantities: YES={yes_qty}, NO={no_qty}")
-            
-            # Calculate prices based on demand proportion
-            total_qty = yes_qty + no_qty
-            if total_qty > 0:
-                # Round to nearest 0.5
-                yes_price = round(yes_qty / total_qty * 10 * 2) / 2
-                no_price = round(no_qty / total_qty * 10 * 2) / 2
-                
-                # Validate ranges
-                yes_price = min(9.5, max(0.5, yes_price))
-                no_price = min(9.5, max(0.5, no_price))
-                
-                # Ensure sum is 10
-                if yes_price + no_price != 10:
-                    yes_price = round(yes_price * 2) / 2
-                    no_price = 10 - yes_price
-                    
-                logger.info(f"Calculated demand-based prices: YES={yes_price}, NO={no_price}")
-            else:
-                yes_price = market_data["yes_price"]
-                no_price = market_data["no_price"]
-                logger.info(f"Using existing prices: YES={yes_price}, NO={no_price}")
-            
-            # Update data
-            market_data["yes_price"] = yes_price
-            market_data["no_price"] = no_price
-            market_data["yes_demand"] = yes_qty
-            market_data["no_demand"] = no_qty
-            market_data["last_updated"] = datetime.utcnow().isoformat()
-            
-            send_updated_market_price(market_id, yes_price, no_price)
-            # Save to Redis
-            redis_client.set(f"market:{market_id}:data", json.dumps(market_data))
-            return market_data
-        except Exception as e:
-            logger.error(f"Error calculating demand-based prices: {str(e)}")
-            return None
-    
-
 # Order book operations
 class OrderBook:
 
@@ -806,8 +571,13 @@ class OrderBook:
         
         # Update market prices after matching
         if matched_trades:
-            MarketManager.update_market_prices_with_vwap(redis_client, market_id)
-            
+            # Get the updated market data to send the latest prices
+            updated_market_data = MarketManager.get_market_data(redis_client, market_id)
+            if updated_market_data:
+                # Send the prices that were updated during matching
+                send_updated_market_price(market_id, 
+                                        updated_market_data["yes_price"], 
+                                        updated_market_data["no_price"])
             # Send trades to Frappe
             send_trades_to_frappe([t for t in matched_trades if isinstance(t, dict)])
         
@@ -999,7 +769,7 @@ class OrderBook:
                         "quantity": match_quantity,
                         "executed_at": datetime.utcnow().isoformat()
                     }
-                    
+
                     # Store the trade in Redis
                     redis_client.set(f"trade:{trade['trade_id']}", json.dumps(trade))
                     redis_client.sadd(f"market:{market_id}:trades", trade["trade_id"])
@@ -1010,6 +780,16 @@ class OrderBook:
                     # Update orders in transaction
                     pipe = redis_client.pipeline()
                     
+                    market_key = f"market:{market_id}:data"
+                    market_data_json = redis_client.get(market_key)
+                    if market_data_json:
+                        market_data = json.loads(market_data_json)
+                        market_data["yes_price"] = yes_price
+                        market_data["no_price"] = no_price
+                        market_data["last_updated"] = datetime.utcnow().isoformat()
+                        market_data["last_trade_id"] = trade["trade_id"]
+                        pipe.set(market_key, json.dumps(market_data))
+
                     # Determine correct YES order status
                     yes_status = OrderStatus.FILLED if new_yes_filled >= yes_order_fresh["quantity"] else OrderStatus.PARTIAL
                     
@@ -1301,6 +1081,25 @@ class OrderBook:
                         pipe.sadd(f"order:{sell_order_id}:trades", trade["trade_id"])
                         pipe.sadd(f"order:{buy_order_id}:trades", trade["trade_id"])
                         
+                        market_key = f"market:{market_id}:data"
+                        market_data_json = redis_client.get(market_key)
+                        if market_data_json:
+                            market_data = json.loads(market_data_json)
+                            
+                            # For sell orders of the same type, we use the trade price directly
+                            if option_type == OptionType.YES:
+                                yes_price = sell_price
+                                no_price = TOTAL_PAYOUT - yes_price
+                            else:  # NO
+                                no_price = sell_price
+                                yes_price = TOTAL_PAYOUT - no_price
+                                
+                            market_data["yes_price"] = yes_price
+                            market_data["no_price"] = no_price
+                            market_data["last_updated"] = datetime.utcnow().isoformat()
+                            market_data["last_trade_id"] = trade["trade_id"]
+                            pipe.set(market_key, json.dumps(market_data))
+
                         # Update SELL order
                         sell_status = OrderStatus.FILLED if new_sell_filled >= sell_order_fresh["quantity"] else OrderStatus.PARTIAL
                         sell_order_updated = {
@@ -1453,6 +1252,88 @@ async def place_order(order: OrderRequest, background_tasks: BackgroundTasks, re
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process order: {str(e)}"
         )
+   
+@app.put("/orders/update_quantity", response_model=OrderResponse, status_code=status.HTTP_200_OK)
+async def update_order_quantity(update_req: UpdateOrderRequest, redis_client = Depends(get_redis)):
+    """
+    Update an existing order's quantity (only supports reducing quantity)
+    """
+    order_id = update_req.order_id
+    new_quantity = update_req.new_quantity
+    
+    # Get the order
+    order = OrderBook.get_order(redis_client, order_id)
+    if not order:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Order not found"
+        )
+    
+    # Check if order can be updated
+    if order["status"] in [OrderStatus.FILLED, OrderStatus.CANCELLED]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot update an order with status: {order['status']}"
+        )
+    
+    # Get market data to check status
+    market_data = MarketManager.get_market_data(redis_client, order["market_id"])
+    if not market_data or market_data["status"] != MarketStatus.OPEN:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot update order - market is not open"
+        )
+    
+    # Check if new quantity is valid (less than original and greater than filled)
+    original_quantity = order["quantity"]
+    filled_quantity = order.get("filled_quantity", 0)
+    if filled_quantity is None:
+        filled_quantity = 0
+    
+    if new_quantity >= original_quantity:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New quantity must be less than original quantity"
+        )
+    
+    if new_quantity < filled_quantity:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"New quantity cannot be less than filled quantity ({filled_quantity})"
+        )
+    
+    try:
+        # Start a transaction
+        pipe = redis_client.pipeline()
+        
+        # Update the order
+        updated_order = {
+            **order,
+            "quantity": new_quantity,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        # If order was PARTIAL and new quantity equals filled quantity, mark as FILLED
+        if order["status"] == OrderStatus.PARTIAL and new_quantity == filled_quantity:
+            updated_order["status"] = OrderStatus.FILLED
+            # Remove from order book if fully filled
+            order_book_key = f"order_book:{order['market_id']}:{order['option_type']}:{order['order_type']}"
+            pipe.zrem(order_book_key, order_id)
+        
+        # Save the updated order
+        pipe.set(f"order:{order_id}", json.dumps(updated_order))
+        
+        # Execute transaction
+        pipe.execute()
+        
+        return updated_order
+        
+    except Exception as e:
+        logger.error(f"Error updating order quantity: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update order"
+        )
 
 @app.delete("/orders/{order_id}", status_code=status.HTTP_200_OK)
 async def cancel_order(order_id: str, redis_client = Depends(get_redis)):
@@ -1495,7 +1376,6 @@ async def cancel_order(order_id: str, redis_client = Depends(get_redis)):
         
         # Execute the transaction
         pipe.execute()
-        
         # Return appropriate response based on order type
         if order["order_type"] == OrderType.SELL:
             return {
