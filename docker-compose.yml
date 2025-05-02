@@ -11,7 +11,7 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
-
+  
   redis:
     image: redis:6.2-alpine
     ports:
