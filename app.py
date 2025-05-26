@@ -111,7 +111,20 @@ class MarketRequest(BaseModel):
 class UpdateOrderRequest(BaseModel):
     order_id: str = Field(..., description="ID of the order to update")
     new_quantity: int = Field(..., gt=0, description="New order quantity (must be less than original quantity)")
- 
+
+# Add this new request model after the existing UpdateOrderRequest model
+class UpdateOrderPriceRequest(BaseModel):
+    order_id: str = Field(..., description="ID of the order to update")
+    new_price: float = Field(..., description="New order price (0.5-9.5 in 0.5 increments)")
+    
+    @validator('new_price')
+    def validate_price(cls, value):
+        # Validate price is within range and a valid increment
+        if value not in VALID_PRICES:
+            valid_prices_str = ", ".join([str(p) for p in VALID_PRICES])
+            raise ValueError(f"Price must be one of the following values: {valid_prices_str}")
+        return value
+
 class OrderResponse(BaseModel):
     order_id: str
     user_id: str
@@ -1333,6 +1346,94 @@ async def update_order_quantity(update_req: UpdateOrderRequest, redis_client = D
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update order"
+        )
+
+
+@app.put("/orders/update_price", response_model=OrderResponse, status_code=status.HTTP_200_OK)
+async def update_order_price(update_req: UpdateOrderPriceRequest, background_tasks: BackgroundTasks, redis_client = Depends(get_redis)):
+    """
+    Update an existing order's price
+    """
+    order_id = update_req.order_id
+    new_price = update_req.new_price
+    
+    # Get the order
+    order = OrderBook.get_order(redis_client, order_id)
+    if not order:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Order not found"
+        )
+    
+    # Check if order can be updated
+    if order["status"] in [OrderStatus.FILLED, OrderStatus.CANCELLED]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot update an order with status: {order['status']}"
+        )
+    
+    # Get market data to check status
+    market_data = MarketManager.get_market_data(redis_client, order["market_id"])
+    if not market_data or market_data["status"] != MarketStatus.OPEN:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot update order - market is not open"
+        )
+    
+    # Check if the order has any filled quantity
+    filled_quantity = order.get("filled_quantity", 0)
+    if filled_quantity is None:
+        filled_quantity = 0
+    
+    if filled_quantity > 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot change price for partially filled orders"
+        )
+    
+    # If price is unchanged, return early
+    if order["price"] == new_price:
+        return order
+    
+    try:
+        # Remove the order from the order book with old price
+        OrderBook.remove_order_from_book(redis_client, order)
+        
+        # Update order with new price
+        updated_order = {
+            **order,
+            "price": new_price,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        # Start a transaction
+        pipe = redis_client.pipeline()
+        
+        # Save the updated order
+        pipe.set(f"order:{order_id}", json.dumps(updated_order))
+        
+        # Re-add to order book with new price
+        order_book_key = f"order_book:{order['market_id']}:{order['option_type']}:{order['order_type']}"
+        # For BUY orders, highest price first (negate), for SELL orders, lowest price first
+        score = -new_price if order["order_type"] == OrderType.BUY else new_price
+        pipe.zadd(order_book_key, {order_id: score})
+        
+        # Execute transaction
+        pipe.execute()
+        
+        # Send order update to Frappe
+        send_order_update_to_frappe(updated_order)
+        
+        # Trigger order matching after price update
+        background_tasks.add_task(OrderBook.match_orders, redis_client, order["market_id"])
+        
+        return updated_order
+        
+    except Exception as e:
+        logger.error(f"Error updating order price: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update order price: {str(e)}"
         )
 
 @app.delete("/orders/{order_id}", status_code=status.HTTP_200_OK)
